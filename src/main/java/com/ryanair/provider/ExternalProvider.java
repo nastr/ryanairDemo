@@ -12,6 +12,7 @@ public interface ExternalProvider {
 
     Schedule getSchedule(String departure, String arrival, Integer year, Integer month);
 
-    List<Schedule> getSchedules(String departure, String arrival,
-                                LocalDateTime departureDateTime, LocalDateTime arrivalDateTime);
+    List<Schedule> getSchedules(String departure, String arrival, LocalDateTime departureDateTime, LocalDateTime arrivalDateTime);
+
+    List<Route> getInterconnRoutes(String departure, String arrival);
 }

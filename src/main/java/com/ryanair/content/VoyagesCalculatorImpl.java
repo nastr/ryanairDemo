@@ -3,7 +3,6 @@ package com.ryanair.content;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ryanair.model.Leg;
-import com.ryanair.model.Route;
 import com.ryanair.model.Schedule;
 import com.ryanair.model.Voyage;
 import com.ryanair.provider.ExternalProvider;
@@ -44,47 +43,40 @@ public class VoyagesCalculatorImpl implements VoyagesCalculator {
     }
 
     public List<Voyage> getCombinedVoyages(String departure, String arrival, LocalDateTime departureDateTime, LocalDateTime arrivalDateTime, Long hoursForInterconnect) {
-
         CompletableFuture<List<Voyage>> directFutore = CompletableFuture.supplyAsync(() -> getDirectVoyages(departure, arrival, departureDateTime, arrivalDateTime));
         CompletableFuture<List<Voyage>> interconnFuture = CompletableFuture.supplyAsync(() -> getInterconnVoyages(departure, arrival, departureDateTime, arrivalDateTime, hoursForInterconnect));
 
-        List<Voyage> direct;
-        List<Voyage> interconn;
         try {
             CompletableFuture.allOf(directFutore, interconnFuture).get();
-            direct = directFutore.get();
-            interconn = interconnFuture.get();
+            return Stream.concat(directFutore.get().stream(), interconnFuture.get().stream()).collect(Collectors.toList());
         } catch (InterruptedException | ExecutionException e) {
             logger.error(e.getMessage());
             return null;
         }
-
-        return Stream.concat(direct.stream(), interconn.stream()).collect(Collectors.toList());
     }
 
     public List<Voyage> getDirectVoyages(String departure, String arrival, LocalDateTime departureDateTime, LocalDateTime arrivalDateTime) {
-        return provider.getSchedules(departure, arrival, departureDateTime, arrivalDateTime).stream().flatMap(d -> d.getDays().stream()
-                .flatMap(d1 -> d1.getFlights().stream().map(d2 -> {
-                    Leg l = new Leg(departure, arrival,
-                            LocalDateTime.of(LocalDate.of(d.getYear(), d.getMonth(), d1.getDay()), d2.getDepartureTime()),
-                            LocalDateTime.of(LocalDate.of(d.getYear(), d.getMonth(), d1.getDay()), d2.getArrivalTime()));
-                    if (l.getDepartureDateTime().isAfter(departureDateTime) && l.getArrivalDateTime().isBefore(arrivalDateTime))
-                        return new Voyage(0, Collections.singletonList(l));
-                    else
-                        return null;
-                }).filter(Objects::nonNull))).collect(Collectors.toList());
+        return provider.getSchedules(departure, arrival, departureDateTime, arrivalDateTime)
+                .stream().flatMap(schedule -> schedule.getDays()
+                        .stream().flatMap(day -> day.getFlights()
+                                .stream().map(flight -> {
+                                    Leg l = new Leg(departure, arrival,
+                                            LocalDateTime.of(LocalDate.of(schedule.getYear(), schedule.getMonth(), day.getDay()), flight.getDepartureTime()),
+                                            LocalDateTime.of(LocalDate.of(schedule.getYear(), schedule.getMonth(), day.getDay()), flight.getArrivalTime()));
+                                    if (l.getDepartureDateTime().isAfter(departureDateTime) && l.getArrivalDateTime().isBefore(arrivalDateTime))
+                                        return new Voyage(0, Collections.singletonList(l));
+                                    else
+                                        return null;
+                                }).filter(Objects::nonNull))).collect(Collectors.toList());
     }
 
     public List<Voyage> getInterconnVoyages(String departure, String arrival, LocalDateTime departureDateTime, LocalDateTime arrivalDateTime, Long hoursForInterconnect) {
-        List<Route> routes = provider.getRoutes();
-        return routes.stream().parallel()
-                .filter(r -> routes.stream().anyMatch(t -> t.getAirportFrom().equals(departure) &&
-                        r.getAirportFrom().equals(t.getAirportTo()) && r.getAirportTo().equals(arrival)))
-                .flatMap(r -> {
+        return provider.getInterconnRoutes(departure, arrival)
+                .stream().parallel().flatMap(route -> {
                     CompletableFuture<List<Schedule>> depaToIntrFut = CompletableFuture.supplyAsync(() ->
-                            provider.getSchedules(departure, r.getAirportFrom(), departureDateTime, arrivalDateTime));
+                            provider.getSchedules(departure, route.getAirportFrom(), departureDateTime, arrivalDateTime));
                     CompletableFuture<List<Schedule>> IntrToArivFut = CompletableFuture.supplyAsync(() ->
-                            provider.getSchedules(r.getAirportFrom(), arrival, departureDateTime, arrivalDateTime));
+                            provider.getSchedules(route.getAirportFrom(), arrival, departureDateTime, arrivalDateTime));
                     List<Schedule> depaToIntr;
                     List<Schedule> IntrToAriv;
                     try {
@@ -95,23 +87,27 @@ public class VoyagesCalculatorImpl implements VoyagesCalculator {
                         logger.error(e.getMessage());
                         return null;
                     }
-                    return depaToIntr.stream().flatMap(d -> d.getDays().stream()
-                            .flatMap(d1 -> d1.getFlights().stream().map(d2 -> {
-                                Leg depaToIntrL = new Leg(departure, r.getAirportFrom(),
-                                        LocalDateTime.of(LocalDate.of(d.getYear(), d.getMonth(), d1.getDay()), d2.getDepartureTime()),
-                                        LocalDateTime.of(LocalDate.of(d.getYear(), d.getMonth(), d1.getDay()), d2.getArrivalTime()));
-                                Optional<Leg> IntrToArivL = IntrToAriv.stream().flatMap(z -> z.getDays().stream()
-                                        .flatMap(x -> x.getFlights().stream().map(e -> new Leg(r.getAirportFrom(), arrival,
-                                                LocalDateTime.of(LocalDate.of(z.getYear(), z.getMonth(), x.getDay()), e.getDepartureTime()),
-                                                LocalDateTime.of(LocalDate.of(z.getYear(), z.getMonth(), x.getDay()), e.getArrivalTime())))))
-                                        .filter(a -> a.getDepartureDateTime().isAfter(depaToIntrL.getArrivalDateTime().plusHours(2)) &&
-                                                a.getArrivalDateTime().isBefore(arrivalDateTime) &&
-                                                a.getDepartureDateTime().isBefore(depaToIntrL.getArrivalDateTime().plusHours(hoursForInterconnect))).findFirst();
-                                if (IntrToArivL.isPresent() && depaToIntrL.getDepartureDateTime().isAfter(departureDateTime))
-                                    return new Voyage(1, asList(depaToIntrL, IntrToArivL.get()));
-                                else
-                                    return null;
-                            })));
+                    return depaToIntr
+                            .stream().flatMap(schedule -> schedule.getDays()
+                                    .stream().flatMap(day -> day.getFlights()
+                                            .stream().parallel().map(flight -> {
+                                                Leg depaToIntrL = new Leg(departure, route.getAirportFrom(),
+                                                        LocalDateTime.of(LocalDate.of(schedule.getYear(), schedule.getMonth(), day.getDay()), flight.getDepartureTime()),
+                                                        LocalDateTime.of(LocalDate.of(schedule.getYear(), schedule.getMonth(), day.getDay()), flight.getArrivalTime()));
+                                                Optional<Leg> IntrToArivL = IntrToAriv
+                                                        .stream().flatMap(schedule1 -> schedule1.getDays()
+                                                                .stream().flatMap(day1 -> day1.getFlights()
+                                                                        .stream().map(flight1 -> new Leg(route.getAirportFrom(), arrival,
+                                                                                LocalDateTime.of(LocalDate.of(schedule1.getYear(), schedule1.getMonth(), day1.getDay()), flight1.getDepartureTime()),
+                                                                                LocalDateTime.of(LocalDate.of(schedule1.getYear(), schedule1.getMonth(), day1.getDay()), flight1.getArrivalTime())))))
+                                                        .filter(leg -> leg.getDepartureDateTime().isAfter(depaToIntrL.getArrivalDateTime().plusHours(2)) &&
+                                                                leg.getArrivalDateTime().isBefore(arrivalDateTime) &&
+                                                                leg.getDepartureDateTime().isBefore(depaToIntrL.getArrivalDateTime().plusHours(hoursForInterconnect))).findFirst();
+                                                if (IntrToArivL.isPresent() && depaToIntrL.getDepartureDateTime().isAfter(departureDateTime))
+                                                    return new Voyage(1, asList(depaToIntrL, IntrToArivL.get()));
+                                                else
+                                                    return null;
+                                            })));
                 })
                 .filter(Objects::nonNull).collect(Collectors.toList());
     }
