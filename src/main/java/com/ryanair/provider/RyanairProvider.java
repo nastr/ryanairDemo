@@ -13,41 +13,34 @@ import java.net.URL;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Objects;
+import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class RyanairProvider implements ExternalProvider {
+
+    protected int cacheValidSec = 60;
 
     private Logger logger = LogManager.getLogger(RyanairProvider.class);
 
     @Autowired
     private ObjectMapper mapper;
 
-    private String routesUrl = "https://services-api.ryanair.com/locate/3/routes";
-
     private List<Route> routes = new ArrayList<>(5000);
-    private Instant timeStamp = Instant.now();
+    private Instant routesLastReq;
 
-    private static String getSchedulesUrl(String departure, String arrival, Integer year, Integer month) {
-        return "https://services-api.ryanair.com/timtbl/3/schedules/" +
-                departure + "/" +
-                arrival + "/" +
-                "years/" +
-                year + "/" +
-                "months/" +
-                month;
-    }
+    private Map<String, Schedule> schedulesMap = new HashMap<>(200);
+    private Map<String, Instant> schedulesLastReq = new HashMap<>(200);
 
     public List<Route> getRoutes() {
         try {
-            if (routes.isEmpty() || timeStamp.plusSeconds(60).isBefore(Instant.now()))
+            String routesUrl = "https://services-api.ryanair.com/locate/3/routes";
+            if (routes.isEmpty() || routesLastReq.plusSeconds(cacheValidSec).isBefore(Instant.now())) {
                 routes = Arrays.stream(mapper.readValue(new URL(routesUrl), Route[].class))
                         .filter(r -> r.getConnectingAirport() == null && r.getOperator().equalsIgnoreCase("RYANAIR"))
                         .collect(Collectors.toList());
+                routesLastReq = Instant.now();
+            }
             return routes;
         } catch (IOException e) {
             logger.error(e.getMessage());
@@ -57,25 +50,44 @@ public class RyanairProvider implements ExternalProvider {
 
     public Schedule getSchedule(String departure, String arrival, Integer year, Integer month) {
         try {
-            URL url = new URL(getSchedulesUrl(departure, arrival, year, month));
-
-            if (((HttpURLConnection) url.openConnection()).getResponseCode() != 200)
-                return null;
-
-            Schedule s = mapper.readValue(url, Schedule.class);
-            s.setYear(year);
-            return s;
+            String key = departure + "/" + arrival + "/" + "years/" + year + "/" + "months/" + month;
+            if (!schedulesMap.containsKey(key) || schedulesLastReq.get(key).plusSeconds(cacheValidSec).isBefore(Instant.now())) {
+                String link = "https://services-api.ryanair.com/timtbl/3/schedules/" + key;
+                URL url = new URL(link);
+                HttpURLConnection httpURLConnection = (HttpURLConnection) url.openConnection();
+                schedulesLastReq.put(key, Instant.now());
+                if (httpURLConnection.getResponseCode() != 200) {
+                    logger.warn(link + "\t" + httpURLConnection.getResponseMessage());
+                    schedulesMap.put(key, null);
+                    return null;
+                } else {
+                    Schedule s = mapper.readValue(url, Schedule.class);
+                    s.setYear(year);
+                    schedulesMap.put(key, s);
+                    return s;
+                }
+            } else
+                return schedulesMap.get(key);
         } catch (IOException e) {
             logger.error(e.getMessage());
             return null;
         }
     }
 
-    public List<Schedule> getSchedules(String departure, String arrival,
-                                       LocalDateTime departureDateTime, LocalDateTime arrivalDateTime) {
-        return Stream.iterate(departureDateTime, d -> d.plusMonths(1)).parallel()
-                .limit(ChronoUnit.MONTHS.between(departureDateTime, arrivalDateTime) + 1)
+    public List<Schedule> getSchedules(String departure, String arrival, LocalDateTime departureDateTime, LocalDateTime arrivalDateTime) {
+        return Stream.iterate(departureDateTime, d -> d.plusMonths(1))
+                .limit(ChronoUnit.MONTHS.between(departureDateTime, arrivalDateTime) + 1).parallel()
                 .map(d -> getSchedule(departure, arrival, d.getYear(), d.getMonthValue()))
                 .filter(Objects::nonNull).collect(Collectors.toList());
+    }
+
+    public List<Route> getInterconnRoutes(String departure, String arrival) {
+        List<String> interconn = getRoutes().stream().filter(d -> d.getAirportFrom().equals(departure))
+                .map(Route::getAirportTo)
+                .collect(Collectors.toList());
+
+        return getRoutes().stream()
+                .filter(r -> r.getAirportTo().equals(arrival) && interconn.contains(r.getAirportFrom()))
+                .collect(Collectors.toList());
     }
 }
